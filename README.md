@@ -237,3 +237,10 @@ https://www.codewithgpu.com/i/lipku/metahuman-stream/base
 微信公众号：数字人技术  
 ![](https://mmbiz.qpic.cn/sz_mmbiz_jpg/l3ZibgueFiaeyfaiaLZGuMGQXnhLWxibpJUS2gfs8Dje6JuMY8zu2tVyU9n8Zx1yaNncvKHBMibX0ocehoITy5qQEZg/640?wxfrom=12&tp=wxpic&usePicPrefetch=1&wx_fmt=jpeg&amp;from=appmsg)  
 
+## 8. 与Fay对接(https://github.com/xszyou/Fay)
+启动时，把app.py改为fay_connect.py
+例如：
+python fay_connect.py --transport webrtc
+页面修改参考：
+https://qqk9ntwbcit.feishu.cn/wiki/Ik1kwO9X5iilnGkFwRhcnmtvn3e
+
