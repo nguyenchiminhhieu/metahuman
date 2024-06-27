@@ -241,6 +241,8 @@ https://www.codewithgpu.com/i/lipku/metahuman-stream/base
 启动时，把app.py改为fay_connect.py
 例如：
 python fay_connect.py --transport webrtc
+(已测试webrtc方式正常对接，其他待测试)
+
 页面修改参考：
 https://qqk9ntwbcit.feishu.cn/wiki/Ik1kwO9X5iilnGkFwRhcnmtvn3e
 
