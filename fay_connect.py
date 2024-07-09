@@ -147,24 +147,29 @@ async def run(push_url):
     await pc.setRemoteDescription(RTCSessionDescription(sdp=answer, type='answer'))
 
 ##########################################
-async def websocket_client(uri):
+async def websocket_client():
+    uri = "ws://localhost:10002"
+    backoff = 1
+
     while True:
         try:
             async with websockets.connect(uri) as websocket:
+                backoff = 1  # Reset backoff on successful connection
                 while True:
                     message = await websocket.recv()
                     data = json.loads(message)
                     if data.get("Topic") == "Unreal" and data.get("Data") and data["Data"].get("Key") == "text":
                         value = data["Data"]["Value"]
                         print(f"Received Value: {value}")
+                        # 这里可以将value发送到nerfreal
                         nerfreal.put_msg_txt(value)
-        except websockets.ConnectionClosed:
-            print('Connection closed. Reconnecting...')
-            await asyncio.sleep(5) 
+        except (websockets.exceptions.ConnectionClosed, websockets.exceptions.InvalidMessage) as e:
+            print(f'WebSocket error: {e}. Reconnecting in {backoff} seconds...')
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 64) 
 
-def start_websocket_client(uri):
-    global websocket_task
-    websocket_task = asyncio.new_event_loop().create_task(websocket_client(uri))
+def start_websocket_client():
+    asyncio.new_event_loop().run_until_complete(websocket_client())
 
 if __name__ == '__main__':
     multiprocessing.set_start_method('spawn')
@@ -386,7 +391,7 @@ if __name__ == '__main__':
     Thread(target=run_server, args=(web.AppRunner(appasync),)).start()
 
     # Start WebSocket client in a new thread
-    start_websocket_client('ws://localhost:10002')
+    Thread(target=start_websocket_client).start()
 
     print('start websocket server')
     #app.on_shutdown.append(on_shutdown)
