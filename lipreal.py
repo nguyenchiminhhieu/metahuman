@@ -23,8 +23,8 @@ from ttsreal import EdgeTTS,VoitsTTS,XTTS
 from lipasr import LipASR
 import asyncio
 from av import AudioFrame, VideoFrame
-
 from wav2lip.models import Wav2Lip
+from basereal import BaseReal
 
 from tqdm import tqdm
 
@@ -143,9 +143,10 @@ def inference(render_event,batch_size,face_imgs_path,audio_feat_queue,audio_out_
     print('musereal inference processor stop')
 
 @torch.no_grad()
-class LipReal:
+class LipReal(BaseReal):
     def __init__(self, opt):
-        self.opt = opt # shared with the trainer's opt to support in-place modification of rendering parameters.
+        super().__init__(opt)
+        #self.opt = opt # shared with the trainer's opt to support in-place modification of rendering parameters.
         self.W = opt.W
         self.H = opt.H
 
@@ -163,13 +164,8 @@ class LipReal:
         #self.__loadmodels()
         self.__loadavatar()
 
-        self.asr = LipASR(opt)
-        if opt.tts == "edgetts":
-            self.tts = EdgeTTS(opt,self)
-        elif opt.tts == "gpt-sovits":
-            self.tts = VoitsTTS(opt,self)
-        elif opt.tts == "xtts":
-            self.tts = XTTS(opt,self)
+        self.asr = LipASR(opt,self)
+        self.asr.warm_up()
         #self.__warm_up()
         
         self.render_event = mp.Event()
@@ -199,6 +195,10 @@ class LipReal:
     
     def put_audio_frame(self,audio_chunk): #16khz 20ms pcm
         self.asr.put_audio_frame(audio_chunk)
+
+    def pause_talk(self):
+        self.tts.pause_talk()
+        self.asr.pause_talk()
       
 
     def process_frames(self,quit_event,loop=None,audio_track=None,video_track=None):
@@ -208,8 +208,16 @@ class LipReal:
                 res_frame,idx,audio_frames = self.res_frame_queue.get(block=True, timeout=1)
             except queue.Empty:
                 continue
-            if audio_frames[0][1]==1 and audio_frames[1][1]==1: #全为静音数据，只需要取fullimg
-                combine_frame = self.frame_list_cycle[idx]
+            if audio_frames[0][1]!=0 and audio_frames[1][1]!=0: #全为静音数据，只需要取fullimg
+                audiotype = audio_frames[0][1]
+                if self.custom_index.get(audiotype) is not None: #有自定义视频
+                    mirindex = self.mirror_index(len(self.custom_img_cycle[audiotype]),self.custom_index[audiotype])
+                    combine_frame = self.custom_img_cycle[audiotype][mirindex]
+                    self.custom_index[audiotype] += 1
+                    # if not self.custom_opt[audiotype].loop and self.custom_index[audiotype]>=len(self.custom_img_cycle[audiotype]):
+                    #     self.curr_state = 1  #当前视频不循环播放，切换到静音状态
+                else:
+                    combine_frame = self.frame_list_cycle[idx]
             else:
                 bbox = self.coord_list_cycle[idx]
                 combine_frame = copy.deepcopy(self.frame_list_cycle[idx])
@@ -243,6 +251,7 @@ class LipReal:
         #     self.asr.warm_up()
 
         self.tts.render(quit_event)
+        self.init_customindex()
         process_thread = Thread(target=self.process_frames, args=(quit_event,loop,audio_track,video_track))
         process_thread.start()
 
@@ -257,9 +266,12 @@ class LipReal:
             t = time.perf_counter()
             self.asr.run_step()
 
-            if video_track._queue.qsize()>=2*self.opt.batch_size:
+            # if video_track._queue.qsize()>=2*self.opt.batch_size:
+            #     print('sleep qsize=',video_track._queue.qsize())
+            #     time.sleep(0.04*video_track._queue.qsize()*0.8)
+            if video_track._queue.qsize()>=5:
                 print('sleep qsize=',video_track._queue.qsize())
-                time.sleep(0.04*self.opt.batch_size*1.5)
+                time.sleep(0.04*video_track._queue.qsize()*0.8)
                 
             # delay = _starttime+_totalframe*0.04-time.perf_counter() #40ms
             # if delay > 0:

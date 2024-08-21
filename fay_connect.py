@@ -1,5 +1,5 @@
 # server.py
-from flask import Flask, render_template, send_from_directory, request, jsonify
+from flask import Flask, render_template,send_from_directory,request, jsonify
 from flask_sockets import Sockets
 import base64
 import time
@@ -10,7 +10,7 @@ from geventwebsocket.handler import WebSocketHandler
 import os
 import re
 import numpy as np
-from threading import Thread, Event
+from threading import Thread,Event
 import multiprocessing
 
 from aiohttp import web
@@ -23,66 +23,102 @@ import argparse
 
 import shutil
 import asyncio
-import websockets
 
+import websockets
 app = Flask(__name__)
 sockets = Sockets(app)
-global nerfreal
-
+nerfreals = []
+statreals = [] 
+is_connect = False
+    
 @sockets.route('/humanecho')
 def echo_socket(ws):
+    # 获取WebSocket对象
+    #ws = request.environ.get('wsgi.websocket')
+    # 如果没有获取到，返回错误信息
     if not ws:
         print('未建立连接！')
         return 'Please use WebSocket'
+    # 否则，循环接收和发送消息
     else:
         print('建立连接！')
         while True:
-            message = ws.receive()
-            if not message or len(message) == 0:
+            message = ws.receive()           
+            
+            if not message or len(message)==0:
                 return '输入信息为空'
-            else:
+            else:                                
                 nerfreal.put_msg_txt(message)
+
 
 def llm_response(message):
     from llm.LLM import LLM
-    llm = LLM().init_model('VllmGPT', model_path='THUDM/chatglm3-6b')
+    # llm = LLM().init_model('Gemini', model_path= 'gemini-pro',api_key='Your API Key', proxy_url=None)
+    # llm = LLM().init_model('ChatGPT', model_path= 'gpt-3.5-turbo',api_key='Your API Key')
+    llm = LLM().init_model('VllmGPT', model_path= 'THUDM/chatglm3-6b')
     response = llm.chat(message)
     print(response)
     return response
 
 @sockets.route('/humanchat')
 def chat_socket(ws):
+    # 获取WebSocket对象
+    #ws = request.environ.get('wsgi.websocket')
+    # 如果没有获取到，返回错误信息
     if not ws:
         print('未建立连接！')
         return 'Please use WebSocket'
+    # 否则，循环接收和发送消息
     else:
         print('建立连接！')
         while True:
-            message = ws.receive()
-            if len(message) == 0:
+            message = ws.receive()           
+            
+            if len(message)==0:
                 return '输入信息为空'
             else:
-                res = llm_response(message)
+                res=llm_response(message)                           
                 nerfreal.put_msg_txt(res)
 
 #####webrtc###############################
 pcs = set()
 
+#@app.route('/offer', methods=['POST'])
 async def offer(request):
     params = await request.json()
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
+    sessionid = len(nerfreals)
+    for index,value in enumerate(statreals):
+        if value == 0:
+            sessionid = index
+            break
+    if sessionid>=len(nerfreals):
+        print('reach max session')
+        return -1
+    statreals[sessionid] = 1
+    
     pc = RTCPeerConnection()
     pcs.add(pc)
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
-        print("Connection state is %s" % pc.connectionState)
+        global is_connect
+        print("Connection state is  %s" % pc.connectionState)
         if pc.connectionState == "failed":
             await pc.close()
             pcs.discard(pc)
+            statreals[sessionid] = 0
+        if pc.connectionState == "closed":
+            pcs.discard(pc)
+            statreals[sessionid] = 0
+            is_connect = False
 
-    player = HumanPlayer(nerfreal)
+        if pc.connectionState == "connecting":
+            Thread(target=start_websocket_client).start()
+            print('start websocket server')
+
+    player = HumanPlayer(nerfreals[sessionid])
     audio_sender = pc.addTrack(player.audio)
     video_sender = pc.addTrack(player.video)
 
@@ -91,38 +127,58 @@ async def offer(request):
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
 
+    #return jsonify({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})
+
     return web.Response(
         content_type="application/json",
         text=json.dumps(
-            {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+            {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "sessionid":sessionid}
         ),
     )
 
 async def human(request):
     params = await request.json()
 
-    if params['type'] == 'echo':
-        nerfreal.put_msg_txt(params['text'])
-    elif params['type'] == 'chat':
-        res = await asyncio.get_event_loop().run_in_executor(None, llm_response, params['text'])
-        nerfreal.put_msg_txt(res)
+    sessionid = params.get('sessionid',0)
+    if params.get('interrupt'):
+        nerfreals[sessionid].pause_talk()
+
+    if params['type']=='echo':
+        nerfreals[sessionid].put_msg_txt(params['text'])
+    elif params['type']=='chat':
+        res=await asyncio.get_event_loop().run_in_executor(None, llm_response(params['text']))                         
+        nerfreals[sessionid].put_msg_txt(res)
 
     return web.Response(
         content_type="application/json",
         text=json.dumps(
-            {"code": 0, "data": "ok"}
+            {"code": 0, "data":"ok"}
+        ),
+    )
+
+async def set_audiotype(request):
+    params = await request.json()
+
+    sessionid = params.get('sessionid',0)    
+    nerfreals[sessionid].set_curr_state(params['audiotype'],params['reinit'])
+
+    return web.Response(
+        content_type="application/json",
+        text=json.dumps(
+            {"code": 0, "data":"ok"}
         ),
     )
 
 async def on_shutdown(app):
+    # close peer connections
     coros = [pc.close() for pc in pcs]
     await asyncio.gather(*coros)
     pcs.clear()
 
-async def post(url, data):
+async def post(url,data):
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=data) as response:
+            async with session.post(url,data=data) as response:
                 return await response.text()
     except aiohttp.ClientError as e:
         print(f'Error: {e}')
@@ -133,40 +189,37 @@ async def run(push_url):
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
-        print("Connection state is %s" % pc.connectionState)
+        print("Connection state  is %s" % pc.connectionState)
         if pc.connectionState == "failed":
             await pc.close()
             pcs.discard(pc)
+        if pc.connectionState == "connecting":
+            Thread(target=start_websocket_client).start()
 
-    player = HumanPlayer(nerfreal)
+    player = HumanPlayer(nerfreals[0])
     audio_sender = pc.addTrack(player.audio)
     video_sender = pc.addTrack(player.video)
 
     await pc.setLocalDescription(await pc.createOffer())
-    answer = await post(push_url, pc.localDescription.sdp)
-    await pc.setRemoteDescription(RTCSessionDescription(sdp=answer, type='answer'))
-
+    answer = await post(push_url,pc.localDescription.sdp)
+    await pc.setRemoteDescription(RTCSessionDescription(sdp=answer,type='answer'))
 ##########################################
-async def websocket_client():
-    uri = "ws://localhost:10002"
-    backoff = 1
+# os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
+# os.environ['MULTIPROCESSING_METHOD'] = 'forkserver'                                                    
 
-    while True:
-        try:
-            async with websockets.connect(uri) as websocket:
-                backoff = 1  # Reset backoff on successful connection
-                while True:
-                    message = await websocket.recv()
-                    data = json.loads(message)
-                    if data.get("Topic") == "Unreal" and data.get("Data") and data["Data"].get("Key") == "text":
-                        value = data["Data"]["Value"]
-                        print(f"Received Value: {value}")
-                        # 这里可以将value发送到nerfreal
-                        nerfreal.put_msg_txt(value)
-        except (websockets.exceptions.ConnectionClosed, websockets.exceptions.InvalidMessage) as e:
-            print(f'WebSocket error: {e}. Reconnecting in {backoff} seconds...')
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 64) 
+async def websocket_client():
+    global is_connect
+    uri = "ws://localhost:10002"  # WebSocket服务端地址
+    async with websockets.connect(uri) as websocket:
+        await websocket.send("Hello, server!")
+        is_connect = True
+        while is_connect:
+            message = await websocket.recv()
+            data = json.loads(message)
+            if data.get("Topic") == "Unreal" and data.get("Data") and data["Data"].get("Key") == "text":
+                value = data["Data"]["Value"]
+                print(f"Received Value: {value}")
+                nerfreal.put_msg_txt(value)
 
 def start_websocket_client():
     asyncio.new_event_loop().run_until_complete(websocket_client())
@@ -177,12 +230,14 @@ if __name__ == '__main__':
     parser.add_argument('--pose', type=str, default="data/data_kf.json", help="transforms.json, pose source")
     parser.add_argument('--au', type=str, default="data/au.csv", help="eye blink area")
     parser.add_argument('--torso_imgs', type=str, default="", help="torso images path")
+
     parser.add_argument('-O', action='store_true', help="equals --fp16 --cuda_ray --exp_eye")
+
     parser.add_argument('--data_range', type=int, nargs='*', default=[0, -1], help="data range to use")
     parser.add_argument('--workspace', type=str, default='data/video')
     parser.add_argument('--seed', type=int, default=0)
 
-        ### training options
+    ### training options
     parser.add_argument('--ckpt', type=str, default='data/pretrained/ngp_kf.pth')
    
     parser.add_argument('--num_rays', type=int, default=4096 * 16, help="num rays sampled per image for each training step")
@@ -287,9 +342,11 @@ if __name__ == '__main__':
     parser.add_argument('--bbox_shift', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=16)
 
-    parser.add_argument('--customvideo', action='store_true', help="custom video")
-    parser.add_argument('--customvideo_img', type=str, default='data/customvideo/img')
-    parser.add_argument('--customvideo_imgnum', type=int, default=1)
+    # parser.add_argument('--customvideo', action='store_true', help="custom video")
+    # parser.add_argument('--customvideo_img', type=str, default='data/customvideo/img')
+    # parser.add_argument('--customvideo_imgnum', type=int, default=1)
+
+    parser.add_argument('--customvideo_config', type=str, default='')
 
     parser.add_argument('--tts', type=str, default='edgetts') #xtts gpt-sovits
     parser.add_argument('--REF_FILE', type=str, default=None)
@@ -303,34 +360,47 @@ if __name__ == '__main__':
     parser.add_argument('--transport', type=str, default='rtcpush') #rtmp webrtc rtcpush
     parser.add_argument('--push_url', type=str, default='http://localhost:1985/rtc/v1/whip/?app=live&stream=livestream') #rtmp://localhost/live/livestream
 
+    parser.add_argument('--max_session', type=int, default=1)  #multi session count
     parser.add_argument('--listenport', type=int, default=8010)
 
     opt = parser.parse_args()
+    #app.config.from_object(opt)
+    #print(app.config)
+    opt.customopt = []
+    if opt.customvideo_config!='':
+        with open(opt.customvideo_config,'r') as file:
+            opt.customopt = json.load(file)
 
     if opt.model == 'ernerf':
         from ernerf.nerf_triplane.provider import NeRFDataset_Test
         from ernerf.nerf_triplane.utils import *
         from ernerf.nerf_triplane.network import NeRFNetwork
         from nerfreal import NeRFReal
-
+        # assert test mode
         opt.test = True
         opt.test_train = False
+        #opt.train_camera =True
+        # explicit smoothing
         opt.smooth_path = True
         opt.smooth_lips = True
 
         assert opt.pose != '', 'Must provide a pose source'
+
+        # if opt.O:
         opt.fp16 = True
         opt.cuda_ray = True
         opt.exp_eye = True
         opt.smooth_eye = True
 
-        if opt.torso_imgs == '':
+        if opt.torso_imgs=='': #no img,use model output
             opt.torso = True
 
+        # assert opt.cuda_ray, "Only support CUDA ray mode."
         opt.asr = True
 
         if opt.patch_size > 1:
-            assert opt.num_rays % (opt.patch_size ** 2) == 0
+            # assert opt.patch_size > 16, "patch_size should > 16 to run LPIPS loss."
+            assert opt.num_rays % (opt.patch_size ** 2) == 0, "patch_size ** 2 should be dividable by num_rays."
         seed_everything(opt.seed)
         print(opt)
 
@@ -338,7 +408,7 @@ if __name__ == '__main__':
         model = NeRFNetwork(opt)
 
         criterion = torch.nn.MSELoss(reduction='none')
-        metrics = []
+        metrics = [] # use no metric in GUI for faster initialization...
         print(model)
         trainer = Trainer('ngp', opt, model, device=device, workspace=opt.workspace, criterion=criterion, fp16=opt.fp16, metrics=metrics, use_checkpoint=opt.ckpt)
 
@@ -346,19 +416,30 @@ if __name__ == '__main__':
         model.aud_features = test_loader._data.auds
         model.eye_areas = test_loader._data.eye_area
 
-        nerfreal = NeRFReal(opt, trainer, test_loader)
+        # we still need test_loader to provide audio features for testing.
+        for _ in range(opt.max_session):
+            nerfreal = NeRFReal(opt, trainer, test_loader)
+            nerfreals.append(nerfreal)
     elif opt.model == 'musetalk':
         from musereal import MuseReal
         print(opt)
-        nerfreal = MuseReal(opt)
+        for _ in range(opt.max_session):
+            nerfreal = MuseReal(opt)
+            nerfreals.append(nerfreal)
     elif opt.model == 'wav2lip':
         from lipreal import LipReal
         print(opt)
-        nerfreal = LipReal(opt)
+        for _ in range(opt.max_session):
+            nerfreal = LipReal(opt)
+            nerfreals.append(nerfreal)
+    
+    for _ in range(opt.max_session):
+        statreals.append(0)
 
-    if opt.transport == 'rtmp':
+    #txt_to_audio('我是中国人,我来自北京')
+    if opt.transport=='rtmp':
         thread_quit = Event()
-        rendthrd = Thread(target=nerfreal.render, args=(thread_quit,))
+        rendthrd = Thread(target=nerfreals[0].render,args=(thread_quit,))
         rendthrd.start()
 
     #############################################################################
@@ -366,15 +447,18 @@ if __name__ == '__main__':
     appasync.on_shutdown.append(on_shutdown)
     appasync.router.add_post("/offer", offer)
     appasync.router.add_post("/human", human)
-    appasync.router.add_static('/', path='web')
+    appasync.router.add_post("/set_audiotype", set_audiotype)
+    appasync.router.add_static('/',path='web')
 
+    # Configure default CORS settings.
     cors = aiohttp_cors.setup(appasync, defaults={
-        "*": aiohttp_cors.ResourceOptions(
-            allow_credentials=True,
-            expose_headers="*",
-            allow_headers="*",
-        )
-    })
+            "*": aiohttp_cors.ResourceOptions(
+                allow_credentials=True,
+                expose_headers="*",
+                allow_headers="*",
+            )
+        })
+    # Configure CORS on all routes.
     for route in list(appasync.router.routes()):
         cors.add(route)
 
@@ -384,19 +468,19 @@ if __name__ == '__main__':
         loop.run_until_complete(runner.setup())
         site = web.TCPSite(runner, '0.0.0.0', opt.listenport)
         loop.run_until_complete(site.start())
-        if opt.transport == 'rtcpush':
+        # Thread(target=start_websocket_client).start()
+        # print('start websocket server')
+        if opt.transport=='rtcpush':
             loop.run_until_complete(run(opt.push_url))
-        loop.run_forever()
+        loop.run_forever()    
+    #Thread(target=run_server, args=(web.AppRunner(appasync),)).start()
+    run_server(web.AppRunner(appasync))
 
-    Thread(target=run_server, args=(web.AppRunner(appasync),)).start()
-
-    # Start WebSocket client in a new thread
-    Thread(target=start_websocket_client).start()
-
-    print('start websocket server')
     #app.on_shutdown.append(on_shutdown)
     #app.router.add_post("/offer", offer)
-    server = pywsgi.WSGIServer(('0.0.0.0', 8000), app, handler_class=WebSocketHandler)
-    server.serve_forever()
+
+    # print('start websocket server')
+    # server = pywsgi.WSGIServer(('0.0.0.0', 8000), app, handler_class=WebSocketHandler)
+    # server.serve_forever()
     
     
